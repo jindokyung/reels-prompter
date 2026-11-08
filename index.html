@@ -80,6 +80,7 @@
 
   #panel { position: absolute; left: 10px; right: 10px; top: calc(var(--safe-t) + 10px); border-radius: 18px; overflow: hidden;
     background: var(--panel); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); }
+  #panel.center { top: 50%; transform: translateY(-50%); }
   #lines { padding: 10px 12px 8px; text-align: center; font-weight: 700; letter-spacing: -.01em; }
   #lines > div { line-height: 1.45; min-height: 1.45em; white-space: nowrap; overflow: hidden; }
   #prev, #next { cursor: pointer; }
@@ -88,7 +89,7 @@
   #next { font-size: .78em; color: rgba(255,255,255,.72); }
   #hint { text-align: center; padding: 7px 16px 10px; font-size: 13px; color: rgba(255,255,255,.72); border-top: 1px solid rgba(255,255,255,.1); }
 
-  #camInfo { position: absolute; right: 12px; bottom: calc(var(--safe-b) + 170px); font-size: 11px; color: rgba(255,255,255,.55); font-variant-numeric: tabular-nums; }
+  #camInfo { position: absolute; right: 12px; bottom: calc(var(--safe-b) + 214px); font-size: 11px; color: rgba(255,255,255,.55); font-variant-numeric: tabular-nums; }
   #voiceInfo { position: absolute; left: 50%; transform: translateX(-50%); bottom: calc(var(--safe-b) + 154px); padding: 3px 10px; border-radius: 999px; background: rgba(0,0,0,.55); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
   #timer { position: absolute; left: 50%; transform: translateX(-50%); bottom: calc(var(--safe-b) + 118px);
     padding: 4px 12px; border-radius: 999px; background: rgba(0,0,0,.55); font-size: 15px; font-variant-numeric: tabular-nums; }
@@ -234,6 +235,12 @@
         <button id="fontDown" type="button" aria-label="글자 작게">가−</button>
         <button id="fontUp" type="button" aria-label="글자 크게">가+</button>
       </div>
+      <div class="chip" id="leadChip" role="group" aria-label="줄을 일찍 넘기는 정도">
+        <button id="leadDown" type="button" aria-label="늦게 넘기기">−</button>
+        <span id="leadLabel"></span>
+        <button id="leadUp" type="button" aria-label="일찍 넘기기">+</button>
+      </div>
+      <div class="chip"><button id="panelPos" type="button"></button></div>
       <div class="chip" id="speedChip" role="group" aria-label="자동 넘김 빠르기">
         <button id="speedDown" type="button" aria-label="느리게">−</button>
         <span id="speedLabel"></span>
@@ -274,9 +281,9 @@
   <button id="cancel" type="button">취소</button>
 </div>
 
-<script src="matcher.js?v=10"></script>
-<script src="ai.js?v=10"></script>
-<script src="edit.js?v=10"></script>
+<script src="matcher.js?v=11"></script>
+<script src="ai.js?v=11"></script>
+<script src="edit.js?v=11"></script>
 <script>
 const $ = id => document.getElementById(id);
 const store = {
@@ -291,7 +298,7 @@ const HINTS = {
 };
 
 const state = {
-  mode: store.get('mode', 'voice'), font: store.get('font', 28), speed: store.get('speedV2', 4.5),
+  mode: store.get('mode', 'voice'), font: store.get('font', 28), speed: store.get('speedV2', 4.5), lead: store.get('leadV1', 4), panelPos: store.get('panelPos', 'top'),
   facing: 'user', phase: 'idle', pos: 0, norm: '', chunks: [], current: -1, saved: true,
 };
 let replayUrl = '', stream, recorder, chunks = [], recStart = 0, timerId, autoFrame, wakeLock, countToken = 0, blobUrl, savedFile;
@@ -337,7 +344,12 @@ function buildScript(keep) {
 }
 function currentChunk() {
   // 음성인식은 조금 늦게 들어오므로 줄 끝 한두 글자 전에 미리 넘긴다.
-  const lead = c => state.mode === 'voice' ? Math.min(2, Math.floor((c.end - c.start) / 4)) : 0;
+  // 받아쓰기는 말보다 늦게 돌아오므로 그만큼 줄 끝 전에 미리 넘긴다.
+  const lead = c => {
+    if (state.mode !== 'voice') return 0;
+    const len = c.end - c.start;
+    return dg.got ? Math.max(0, Math.min(state.lead, len - 1)) : Math.min(2, Math.floor(len / 4));
+  };
   const i = state.chunks.findIndex(c => state.pos < c.end - lead(c));
   return i < 0 ? state.chunks.length - 1 : i;
 }
@@ -373,6 +385,11 @@ function applySettings() {
   $('hint').textContent = HINTS[state.mode];
   $('speedChip').hidden = state.mode !== 'auto';
   $('speedLabel').textContent = `빠르기 ${state.speed.toFixed(1)}`;
+  $('leadChip').hidden = state.mode !== 'voice';
+  $('leadLabel').textContent = `일찍 넘김 ${state.lead}`;
+  $('panel').classList.toggle('center', state.panelPos === 'center');
+  $('panelPos').textContent = state.panelPos === 'center' ? '대본 위로' : '대본 가운데로';
+  store.set('leadV1', state.lead); store.set('panelPos', state.panelPos);
   store.set('font', state.font); store.set('speedV2', state.speed);
 }
 function setMode(mode, remember = true) {
@@ -386,6 +403,9 @@ $('fontDown').onclick = step('font', -3, 17, 47);
 $('fontUp').onclick = step('font', 3, 17, 47);
 $('speedDown').onclick = step('speed', -0.5, 2, 12);
 $('speedUp').onclick = step('speed', 0.5, 2, 12);
+$('leadDown').onclick = step('lead', -1, 0, 6);
+$('leadUp').onclick = step('lead', 1, 0, 6);
+$('panelPos').onclick = () => { state.panelPos = state.panelPos === 'center' ? 'top' : 'center'; applySettings(); };
 
 /* 음성으로 따라가기 */
 const speech = { rec: null, active: false, failures: 0, heardLength: 0, offset: 0 };
@@ -488,12 +508,13 @@ function startDeepgramAudio() {
     if (dg.ws && dg.ws.readyState === WebSocket.OPEN) dg.ws.send(e.data);
     else dg.queue.push(e.data);
   };
-  rec.start(200);
+  rec.start(100);
   $('voiceInfo').textContent = '음성인식 연결 중';
   dg.levelWait = setTimeout(() => { if (!dg.got) startLevel(); }, 3000);
 }
 function stopDeepgram() {
   dg.closing = true;
+  dg.got = false;
   clearTimeout(dg.levelWait);
   if (dg.rec && dg.rec.state !== 'inactive') dg.rec.stop();
   dg.rec = null;
@@ -625,7 +646,7 @@ async function findLenses() {
 }
 function showCamInfo() {
   const cam = $('cam');
-  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v10`;
+  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v11`;
 }
 async function openCamera() {
   stopCamera();

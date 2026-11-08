@@ -67,28 +67,67 @@
     return prev[b.length];
   }
 
-  // script: normalize된 대본, pos: 지금까지 읽은 글자 수, heard: normalize된 들린 말
-  // 반환: 새 위치. 뒤로는 가지 않는다 (되돌리기는 글자를 눌러서).
-  function follow(script, pos, heard) {
-    const tail = heard.slice(-TAIL);
-    if (tail.length < 3) return pos;
-    // 짧게 들렸을 때는 우연히 맞을 수 있어 더 엄격하게, 더 가까운 곳만 본다.
-    const short = tail.length < 6;
-    const threshold = short ? 0.8 : 0.62;
-    const reach = short ? 10 : LOOKAHEAD;
+  function scan(script, pos, tail, reach, need) {
     const last = Math.min(script.length, pos + reach);
-
-    let best = pos;
-    let bestScore = -1;
-    for (let end = pos + 1; end <= last; end++) {
+    let best = pos, bestScore = -1;
+    // 지금 자리(end = pos)도 후보에 넣는다. 같은 말이 다시 들어와도 한 글자씩 밀려가지 않는다.
+    for (let end = Math.max(pos, 3); end <= last; end++) {
       const len = Math.min(tail.length, end);
-      const piece = script.slice(end - len, end);
-      const similarity = 1 - distance(tail.slice(-len), piece) / tail.length;
-      if (similarity < threshold) continue;
+      const similarity = 1 - distance(tail.slice(-len), script.slice(end - len, end)) / len;
+      if (similarity < need(end - pos)) continue;
       const score = similarity - (end - pos) * 0.002; // 같은 말이 반복되면 가까운 쪽
       if (score > bestScore) { bestScore = score; best = end; }
     }
     return best;
+  }
+
+  // script: normalize된 대본, pos: 지금까지 읽은 글자 수, heard: normalize된 들린 말
+  // 반환: 새 위치. 뒤로는 가지 않는다.
+  function follow(script, pos, heard) {
+    const tail = heard.slice(-TAIL);
+    if (tail.length < 3) return pos;
+    // 짧게 들렸을 때는 우연히 맞을 수 있어 더 엄격하게, 더 가까운 곳만 본다.
+    if (tail.length < 6) return scan(script, pos, tail, 10, () => 0.8);
+    // 멀리 건너뛸수록 더 확실해야 한다.
+    const found = scan(script, pos, tail, LOOKAHEAD, d => 0.62 + Math.max(0, d - 12) * 0.006);
+    if (found > pos || tail.length < 10) return found;
+    // 앞부분을 잘못 받아써서 안 맞을 때는 마지막 말만으로 가까운 곳을 본다.
+    return scan(script, pos, tail.slice(-8), 14, () => 0.78);
+  }
+
+  // 잘못 맞은 결과 하나로 대본이 건너뛰지 않게, 멀리 움직일 때는 다음 결과까지 맞아야 움직인다.
+  function createTracker(script) {
+    const NEAR = 14, BACK = 30, BACK_MIN = 6;
+    let confirmed = 0, pending = null;
+    const agrees = at => pending !== null && Math.abs(at - pending) <= NEAR;
+    const settle = at => { confirmed = at; pending = null; return true; };
+    function behind(heard) { // 앞서 잘못 건너뛰었거나 다시 읽을 때 되돌아갈 자리
+      const tail = heard.slice(-TAIL);
+      if (tail.length < 10) return -1;
+      let best = -1, bestSim = 0.85;
+      for (let end = confirmed - BACK_MIN - 1; end >= Math.max(tail.length, confirmed - BACK); end--) {
+        const sim = 1 - distance(tail, script.slice(end - tail.length, end)) / tail.length;
+        if (sim > bestSim) { bestSim = sim; best = end; }
+      }
+      return best;
+    }
+    return {
+      hear(heard) {
+        const next = follow(script, confirmed, heard);
+        if (next > confirmed) {
+          if (next - confirmed <= NEAR || agrees(next)) return settle(next);
+          pending = next;
+          return false;
+        }
+        const back = behind(heard);
+        if (back < 0) return false;
+        if (agrees(back)) return settle(back);
+        pending = back;
+        return false;
+      },
+      jump(at) { confirmed = at; pending = null; },
+      get pos() { return confirmed; },
+    };
   }
 
   // 대본을 한 줄에 들어가는 짧은 덩어리로 끊는다. 문장부호를 먼저, 그다음 띄어쓰기를 기준으로.
@@ -182,7 +221,7 @@
     return best;
   }
 
-  const api = { normalize, spoken, follow, splitChunks, createPacer, snapToBoundary };
+  const api = { normalize, spoken, follow, createTracker, splitChunks, createPacer, snapToBoundary };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Matcher = api;
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -119,6 +119,8 @@
   #clipToggle { min-height: 44px; padding: 0 14px; border-radius: 10px; background: rgba(40,40,48,.92); color: var(--text); font-size: 14px; }
   #renderView { max-width: 100%; max-height: 52dvh; border-radius: 12px; background: #000; }
   #reviewBar { position: absolute; left: 12px; right: 12px; bottom: calc(var(--safe-b) + 14px); display: grid; grid-template-columns: 1fr 1.6fr; gap: 10px; }
+  #copyLog { position: absolute; top: calc(env(safe-area-inset-top) + 12px); right: 12px; z-index: 2; min-height: 36px; padding: 6px 12px; font-size: 13px; }
+  #copyLog[hidden] { display: none; }
   #retake { height: 56px; border-radius: 14px; background: rgba(40,40,48,.92); font-weight: 600; }
 
   #toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--safe-b) + 210px); max-width: calc(100vw - 32px); width: max-content;
@@ -256,6 +258,7 @@
 
   <div id="review" hidden>
     <video id="replay" controls playsinline></video>
+    <button id="copyLog" type="button" hidden>인식 기록 복사</button>
     <div id="editBar">
       <button class="opt on" data-opt="cut" type="button">무음·NG<br>자르기</button>
       <button class="opt on" data-opt="captions" type="button">자막</button>
@@ -281,9 +284,9 @@
   <button id="cancel" type="button">취소</button>
 </div>
 
-<script src="matcher.js?v=12"></script>
-<script src="ai.js?v=12"></script>
-<script src="edit.js?v=12"></script>
+<script src="matcher.js?v=13"></script>
+<script src="ai.js?v=13"></script>
+<script src="edit.js?v=13"></script>
 <script>
 const $ = id => document.getElementById(id);
 const store = {
@@ -374,6 +377,7 @@ function jumpTo(i) {
   state.pos = state.chunks[i].start;
   speech.offset = speech.heardLength;
   dg.confirmed = state.pos;
+  if (dg.tracker) dg.tracker.jump(state.pos);
   dg.lastMatch = performance.now();
   paint();
 }
@@ -478,13 +482,15 @@ function stopLevel() {
   level.ctx = null; level.an = null;
 }
 /* 진짜 음성인식: 녹화 중인 마이크 소리를 Deepgram으로 보내 받아쓴 글자로 대본 위치를 맞춘다 */
-const dg = { ws: null, rec: null, queue: [], finals: '', got: false, closing: false, confirmed: 0, lastMatch: 0, startedAt: 0 };
+const dg = { ws: null, rec: null, queue: [], finals: '', got: false, closing: false, confirmed: 0, lastMatch: 0, startedAt: 0, tracker: null, log: [] };
+const HOLD_BACK = 6; // 소리로 이만큼 앞서간 정도는 뒤로 당기지 않는다
 const dgKey = () => store.get('deepgramKey', '');
 const DG_FORMAT = 'audio/webm;codecs=opus';
 function connectDeepgram() {
   if (!dgKey() || !window.MediaRecorder || !MediaRecorder.isTypeSupported(DG_FORMAT) || !stream) return;
   const params = new URLSearchParams({ model: 'nova-3', language: 'ko', interim_results: 'true', smart_format: 'false', punctuate: 'false' });
-  Object.assign(dg, { queue: [], finals: '', got: false, closing: false, confirmed: 0, lastMatch: 0, startedAt: 0 });
+  Object.assign(dg, { queue: [], finals: '', got: false, closing: false, confirmed: 0, lastMatch: 0, startedAt: 0, tracker: Matcher.createTracker(state.norm), log: [] });
+  $('copyLog').hidden = true;
   const ws = dg.ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, ['token', dgKey()]);
   ws.onopen = () => { dg.queue.forEach(c => ws.send(c)); dg.queue = []; };
   ws.onmessage = e => handleTranscript(e.data);
@@ -504,12 +510,17 @@ function handleTranscript(data) {
   }
   speech.heardLength = heard.length;
   // 확인된 위치에서만 찾는다. 소리로 이어 가며 앞서간 만큼은 여기서 바로잡힌다.
-  const next = Matcher.follow(state.norm, dg.confirmed, Matcher.spoken(heard.slice(speech.offset)));
-  if (next > dg.confirmed) {
-    dg.confirmed = next;
+  const before = dg.confirmed;
+  if (dg.tracker.hear(Matcher.spoken(heard.slice(speech.offset)))) {
+    const next = dg.confirmed = dg.tracker.pos;
     dg.lastMatch = performance.now();
     $('voiceInfo').textContent = '음성인식으로 따라가는 중';
-    moveTo(next);
+    // 늦게 도착한 결과가 조금 앞서 있던 화면을 뒤로 끌어당기지 않게 한다.
+    if (next < before || state.pos - next > HOLD_BACK || next > state.pos) moveTo(next);
+  }
+  if (text && dg.log.length < 600) {
+    dg.log.push(`${((Date.now() - recStart) / 1000).toFixed(1)}초 ${m.is_final ? '확정' : '임시'} "${text}" 위치 ${before}→${dg.confirmed} 화면 ${state.pos}`);
+    $('copyLog').hidden = false;
   }
 }
 function startDeepgramAudio() {
@@ -658,7 +669,7 @@ async function findLenses() {
 }
 function showCamInfo() {
   const cam = $('cam');
-  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v12`;
+  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v13`;
 }
 async function openCamera() {
   stopCamera();
@@ -814,6 +825,12 @@ async function saveVideo() {
   toast('영상을 내려받았어요.');
 }
 $('save').onclick = saveVideo;
+$('copyLog').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(`대본: ${state.norm}\n` + dg.log.join('\n'));
+    toast('복사했어요. 대화창에 붙여넣어 주세요.');
+  } catch { toast('복사하지 못했어요.'); }
+};
 $('retake').onclick = () => {
   if (!state.saved && !confirm('저장하지 않은 영상은 사라져요. 다시 찍을까요?')) return;
   $('replay').pause(); $('replay').removeAttribute('src'); $('replay').load();

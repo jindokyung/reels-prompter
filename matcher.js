@@ -76,7 +76,7 @@
 
   // 마이크 소리 크기(dB)만으로 말하는지와 말 빠르기를 읽는다. 한국어는 음절 하나가 글자 하나라 음절 수로 따라갈 수 있다.
   function createPacer() {
-    const DIP = 2.5, MIN_GAP = 0.09, HANG = 0.22, RECENT_PEAK = 0.6, WINDOW = 2;
+    const DIP = 2, MIN_GAP = 0.09, HANG = 0.22, RECENT_PEAK = 2.5, WINDOW = 2;
     let floor = null, smooth = null, now = 0, voiced = 0;
     let quietFor = 0, speaking = false, lastPeak = -10;
     let up = true, maxV = -100, minV = 0, rate = 6;
@@ -86,7 +86,7 @@
       now += dt;
       if (floor === null) { floor = db; smooth = db; }
       smooth += (db - smooth) * 0.5;
-      const on = floor + 10, off = floor + 6;
+      const on = floor + 8, off = floor + 5;
       const recent = now - lastPeak < RECENT_PEAK;
 
       if (db < floor) floor += (db - floor) * 0.2;

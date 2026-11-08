@@ -89,6 +89,7 @@
   #hint { text-align: center; padding: 7px 16px 10px; font-size: 13px; color: rgba(255,255,255,.72); border-top: 1px solid rgba(255,255,255,.1); }
 
   #camInfo { position: absolute; right: 12px; bottom: calc(var(--safe-b) + 170px); font-size: 11px; color: rgba(255,255,255,.55); font-variant-numeric: tabular-nums; }
+  #voiceInfo { position: absolute; left: 50%; transform: translateX(-50%); bottom: calc(var(--safe-b) + 154px); padding: 3px 10px; border-radius: 999px; background: rgba(0,0,0,.55); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
   #timer { position: absolute; left: 50%; transform: translateX(-50%); bottom: calc(var(--safe-b) + 118px);
     padding: 4px 12px; border-radius: 999px; background: rgba(0,0,0,.55); font-size: 15px; font-variant-numeric: tabular-nums; }
   #timer::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 7px; border-radius: 50%; background: var(--rec); vertical-align: 1px; }
@@ -212,6 +213,7 @@
   </div>
 
   <div id="camInfo" aria-hidden="true"></div>
+  <div id="voiceInfo" hidden></div>
   <div id="timer" hidden>00:00</div>
   <div id="count" hidden></div>
 
@@ -267,9 +269,9 @@
   <button id="cancel" type="button">취소</button>
 </div>
 
-<script src="matcher.js"></script>
-<script src="ai.js"></script>
-<script src="edit.js"></script>
+<script src="matcher.js?v=9"></script>
+<script src="ai.js?v=9"></script>
+<script src="edit.js?v=9"></script>
 <script>
 const $ = id => document.getElementById(id);
 const store = {
@@ -284,7 +286,7 @@ const HINTS = {
 };
 
 const state = {
-  mode: store.get('mode', 'voice'), font: store.get('font', 28), speed: store.get('speed', 6),
+  mode: store.get('mode', 'voice'), font: store.get('font', 28), speed: store.get('speedV2', 4.5),
   facing: 'user', phase: 'idle', pos: 0, norm: '', chunks: [], current: -1, saved: true,
 };
 let replayUrl = '', stream, recorder, chunks = [], recStart = 0, timerId, autoFrame, wakeLock, countToken = 0, blobUrl, savedFile;
@@ -300,7 +302,7 @@ function toast(msg, ms = 3800) {
 const box = $('script');
 function refreshEditor() {
   const n = Matcher.normalize(box.value).length;
-  $('estimate').textContent = n ? `${box.value.replace(/\s/g, '').length}자 · 읽는 데 약 ${Math.max(1, Math.round(n / 6))}초` : '0자';
+  $('estimate').textContent = n ? `${box.value.replace(/\s/g, '').length}자 · 읽는 데 약 ${Math.max(1, Math.round(n / 5))}초` : '0자';
   $('start').disabled = !n;
   store.set('draft', box.value);
 }
@@ -366,7 +368,7 @@ function applySettings() {
   $('hint').textContent = HINTS[state.mode];
   $('speedChip').hidden = state.mode !== 'auto';
   $('speedLabel').textContent = `빠르기 ${state.speed.toFixed(1)}`;
-  store.set('font', state.font); store.set('speed', state.speed);
+  store.set('font', state.font); store.set('speedV2', state.speed);
 }
 function setMode(mode, remember = true) {
   state.mode = mode;
@@ -386,8 +388,8 @@ const speechApi = () => window.SpeechRecognition || window.webkitSpeechRecogniti
 function fallbackToLevel(msg) {
   stopSpeech();
   if (level.an) startLevel();
-  else setMode('auto', false);
-  toast(msg);
+  else { setMode('auto', false); $('voiceInfo').hidden = true; }
+  if (!speech.track) toast(msg);
 }
 
 /* 음성인식을 쓸 수 없을 때: 녹화 중인 마이크 소리로 말하는 때와 빠르기를 읽어 넘긴다 */
@@ -408,7 +410,7 @@ function startLevel() {
   if (level.timer || !level.an) return;
   const pacer = Matcher.createPacer();
   const buf = new Float32Array(level.an.fftSize);
-  let last = performance.now(), carry = 0, wasTalking = false;
+  let last = performance.now(), carry = 0, wasTalking = false, shown = 0;
   level.timer = setInterval(() => {
     const now = performance.now();
     const dt = Math.min(0.1, (now - last) / 1000);
@@ -416,7 +418,13 @@ function startLevel() {
     level.an.getFloatTimeDomainData(buf);
     let sum = 0;
     for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-    const r = pacer(20 * Math.log10(Math.max(Math.sqrt(sum / buf.length), 1e-6)), dt);
+    const db = 20 * Math.log10(Math.max(Math.sqrt(sum / buf.length), 1e-6));
+    const r = pacer(db, dt);
+    if (now - shown > 200) {
+      shown = now;
+      if (level.ctx.state !== 'running') { level.ctx.resume(); $('voiceInfo').textContent = '마이크 연결 중'; }
+      else $('voiceInfo').textContent = `소리 ${Math.round(db)}dB · ${r.talking ? '말하는 중' : '듣는 중'}`;
+    }
     carry += r.advance;
     if (carry >= 1) { const n = Math.floor(carry); carry -= n; moveTo(state.pos + n); }
     if (r.talking) wasTalking = true;
@@ -433,9 +441,37 @@ function stopLevel() {
   if (level.ctx) level.ctx.close().catch(() => {});
   level.ctx = null; level.an = null;
 }
-function startSpeech() {
+// 최신 크롬은 녹화 중인 마이크를 음성인식에 그대로 넘길 수 있어 충돌이 없다.
+let trackSpeech = store.get('trackSpeech', null);
+function detectTrackSpeech() {
+  if (trackSpeech !== null || !isAndroid() || !speechApi()) return;
+  try {
+    const probe = new (speechApi())();
+    try { probe.start({}); probe.abort(); trackSpeech = false; }
+    catch (err) { trackSpeech = err instanceof TypeError; }
+  } catch { trackSpeech = false; }
+  store.set('trackSpeech', trackSpeech);
+}
+function startFollowing() {
+  try {
+    if (isAndroid() || !speechApi()) {
+      if (!level.an) throw new Error('no microphone analyser');
+      startLevel();
+      const track = stream.getAudioTracks()[0];
+      if (trackSpeech && track) startSpeech(track);
+    } else {
+      startSpeech();
+    }
+  } catch (err) {
+    setMode('auto', false);
+    $('voiceInfo').hidden = true;
+    toast(`소리로 따라가기를 시작하지 못해 자동 넘김으로 바꿨어요. (${err.name})`, 7000);
+  }
+}
+function startSpeech(track) {
   const Api = speechApi();
   if (!Api) return;
+  speech.track = track;
   speech.active = true; speech.failures = 0; speech.heardLength = 0; speech.offset = 0; speech.gotResult = false;
   runSpeech(Api);
   speech.watchdog = setTimeout(() => {
@@ -449,6 +485,8 @@ function runSpeech(Api) {
   rec.onresult = e => {
     speech.failures = 0;
     speech.gotResult = true;
+    if (speech.track && level.timer) { clearInterval(level.timer); level.timer = 0; }
+    $('voiceInfo').textContent = '음성인식으로 따라가는 중';
     let heard = '';
     for (let i = 0; i < e.results.length; i++) heard += e.results[i][0].transcript;
     speech.heardLength = heard.length;
@@ -467,7 +505,7 @@ function runSpeech(Api) {
     speech.heardLength = 0; speech.offset = 0;
     setTimeout(() => { if (speech.active) runSpeech(Api); }, 150);
   };
-  try { rec.start(); } catch { speech.failures++; }
+  try { if (speech.track) rec.start(speech.track); else rec.start(); } catch { speech.failures++; }
 }
 function stopSpeech() {
   speech.active = false;
@@ -516,7 +554,7 @@ async function findLenses() {
 }
 function showCamInfo() {
   const cam = $('cam');
-  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight}`;
+  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v9`;
 }
 async function openCamera() {
   stopCamera();
@@ -572,6 +610,7 @@ function setPhase(phase) {
   $('back').style.visibility = busy ? 'hidden' : 'visible';
   $('flip').style.visibility = busy ? 'hidden' : 'visible';
   $('timer').hidden = phase !== 'rec';
+  $('voiceInfo').hidden = !(phase === 'rec' && state.mode === 'voice');
   $('count').hidden = phase !== 'count';
   $('record').classList.toggle('on', phase === 'rec');
   $('record').setAttribute('aria-label', phase === 'rec' ? '녹화 끝내기' : phase === 'count' ? '시작 취소' : '녹화 시작');
@@ -611,7 +650,7 @@ async function beginRecording() {
   }, 250);
   runAuto();
   // 갤럭시 크롬은 녹화와 음성인식이 마이크를 두고 충돌한다.
-  if (state.mode === 'voice') { if (isAndroid() || !speechApi()) startLevel(); else startSpeech(); }
+  if (state.mode === 'voice') startFollowing();
   // 음성인식이 마이크를 뺏어 영상 소리가 끊기면, 소리를 지키는 쪽을 택한다.
   const mic = stream.getAudioTracks()[0];
   if (mic) mic.onmute = () => {
@@ -685,6 +724,7 @@ $('start').onclick = async () => {
   buildScript(false);
   keepAwake();
   await openCamera();
+  detectTrackSpeech();
 };
 $('back').onclick = () => {
   stopCamera(); letSleep();

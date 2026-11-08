@@ -281,9 +281,9 @@
   <button id="cancel" type="button">취소</button>
 </div>
 
-<script src="matcher.js?v=11"></script>
-<script src="ai.js?v=11"></script>
-<script src="edit.js?v=11"></script>
+<script src="matcher.js?v=12"></script>
+<script src="ai.js?v=12"></script>
+<script src="edit.js?v=12"></script>
 <script>
 const $ = id => document.getElementById(id);
 const store = {
@@ -332,12 +332,12 @@ function buildScript(keep) {
   const max = Math.max(6, Math.floor(width / (state.font * 0.93)));
   let at = 0;
   state.chunks = Matcher.splitChunks(box.value, max).map(text => {
-    const len = Matcher.normalize(text).length;
+    const len = Matcher.spoken(text).length;
     const chunk = { text, start: at, end: at + len };
     at += len;
     return chunk;
   });
-  state.norm = state.chunks.map(c => Matcher.normalize(c.text)).join('');
+  state.norm = state.chunks.map(c => Matcher.spoken(c.text)).join('');
   if (!keep) state.pos = 0;
   state.current = -1;
   paint();
@@ -373,6 +373,8 @@ function jumpTo(i) {
   if (!state.chunks[i]) return;
   state.pos = state.chunks[i].start;
   speech.offset = speech.heardLength;
+  dg.confirmed = state.pos;
+  dg.lastMatch = performance.now();
   paint();
 }
 $('prev').onclick = () => jumpTo(state.current - 1);
@@ -419,6 +421,7 @@ function fallbackToLevel(msg) {
 
 /* 음성인식을 쓸 수 없을 때: 녹화 중인 마이크 소리로 말하는 때와 빠르기를 읽어 넘긴다 */
 const level = { ctx: null, an: null, timer: 0 };
+const MAX_FILL = 15; // 알아듣지 못한 채 소리로만 앞서갈 수 있는 글자 수
 const isAndroid = () => /Android/i.test(navigator.userAgent);
 function armLevel() { // 아이폰·갤럭시는 버튼을 누른 순간에만 오디오를 켤 수 있다
   if (level.ctx || !stream) return;
@@ -445,18 +448,26 @@ function startLevel() {
     for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
     const db = 20 * Math.log10(Math.max(Math.sqrt(sum / buf.length), 1e-6));
     const r = pacer(db, dt);
+    // 음성인식이 켜져 있으면, 한동안 맞는 부분을 못 찾을 때만 소리로 이어 간다.
+    const filling = !dg.ws || now - (dg.got ? dg.lastMatch : dg.startedAt) > (dg.got ? 1500 : 3000);
     if (now - shown > 200) {
       shown = now;
       if (level.ctx.state !== 'running') { level.ctx.resume(); $('voiceInfo').textContent = '마이크 연결 중'; }
-      else $('voiceInfo').textContent = `소리 ${Math.round(db)}dB · ${r.talking ? '말하는 중' : '듣는 중'}`;
+      else if (!dg.ws) $('voiceInfo').textContent = `소리 ${Math.round(db)}dB · ${r.talking ? '말하는 중' : '듣는 중'}`;
+      else if (filling && r.talking) $('voiceInfo').textContent = '못 알아들은 부분은 소리로 잇는 중';
     }
+    if (!filling) { carry = 0; wasTalking = false; return; }
     carry += r.advance;
-    if (carry >= 1) { const n = Math.floor(carry); carry -= n; moveTo(state.pos + n); }
+    if (carry >= 1) {
+      const n = Math.floor(carry);
+      carry -= n;
+      moveTo(dg.ws ? Math.min(state.pos + n, Math.max(state.pos, dg.confirmed + MAX_FILL)) : state.pos + n);
+    }
     if (r.talking) wasTalking = true;
     else if (wasTalking && r.quietFor >= 0.35) {
       wasTalking = false;
       carry = 0;
-      moveTo(Matcher.snapToBoundary(state.chunks, state.pos));
+      if (!dg.ws) moveTo(Matcher.snapToBoundary(state.chunks, state.pos));
     }
   }, 20);
 }
@@ -467,13 +478,13 @@ function stopLevel() {
   level.ctx = null; level.an = null;
 }
 /* 진짜 음성인식: 녹화 중인 마이크 소리를 Deepgram으로 보내 받아쓴 글자로 대본 위치를 맞춘다 */
-const dg = { ws: null, rec: null, queue: [], finals: '', got: false, closing: false, levelWait: 0 };
+const dg = { ws: null, rec: null, queue: [], finals: '', got: false, closing: false, confirmed: 0, lastMatch: 0, startedAt: 0 };
 const dgKey = () => store.get('deepgramKey', '');
 const DG_FORMAT = 'audio/webm;codecs=opus';
 function connectDeepgram() {
   if (!dgKey() || !window.MediaRecorder || !MediaRecorder.isTypeSupported(DG_FORMAT) || !stream) return;
   const params = new URLSearchParams({ model: 'nova-3', language: 'ko', interim_results: 'true', smart_format: 'false', punctuate: 'false' });
-  Object.assign(dg, { queue: [], finals: '', got: false, closing: false });
+  Object.assign(dg, { queue: [], finals: '', got: false, closing: false, confirmed: 0, lastMatch: 0, startedAt: 0 });
   const ws = dg.ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, ['token', dgKey()]);
   ws.onopen = () => { dg.queue.forEach(c => ws.send(c)); dg.queue = []; };
   ws.onmessage = e => handleTranscript(e.data);
@@ -487,18 +498,19 @@ function handleTranscript(data) {
   if (m.is_final) dg.finals += text + ' ';
   const heard = m.is_final ? dg.finals : dg.finals + text;
   if (!heard.trim()) return;
-  const first = !dg.got;
-  if (first) {
+  if (!dg.got) {
     dg.got = true;
-    clearTimeout(dg.levelWait);
-    clearInterval(level.timer); level.timer = 0;
     $('voiceInfo').textContent = '음성인식으로 따라가는 중';
   }
   speech.heardLength = heard.length;
-  const spoken = Matcher.normalize(heard.slice(speech.offset));
-  // 처음 알아들었을 때는 소리로 앞서간 만큼을 바로잡도록 처음부터 찾는다.
-  const next = Matcher.follow(state.norm, first ? 0 : state.pos, spoken);
-  if (!first || next > 0) moveTo(next);
+  // 확인된 위치에서만 찾는다. 소리로 이어 가며 앞서간 만큼은 여기서 바로잡힌다.
+  const next = Matcher.follow(state.norm, dg.confirmed, Matcher.spoken(heard.slice(speech.offset)));
+  if (next > dg.confirmed) {
+    dg.confirmed = next;
+    dg.lastMatch = performance.now();
+    $('voiceInfo').textContent = '음성인식으로 따라가는 중';
+    moveTo(next);
+  }
 }
 function startDeepgramAudio() {
   speech.offset = 0; speech.heardLength = 0;
@@ -510,12 +522,12 @@ function startDeepgramAudio() {
   };
   rec.start(100);
   $('voiceInfo').textContent = '음성인식 연결 중';
-  dg.levelWait = setTimeout(() => { if (!dg.got) startLevel(); }, 3000);
+  dg.startedAt = dg.lastMatch = performance.now();
+  startLevel(); // 알아듣지 못하는 구간은 말소리로 이어 간다
 }
 function stopDeepgram() {
   dg.closing = true;
   dg.got = false;
-  clearTimeout(dg.levelWait);
   if (dg.rec && dg.rec.state !== 'inactive') dg.rec.stop();
   dg.rec = null;
   const ws = dg.ws;
@@ -582,7 +594,7 @@ function runSpeech(Api) {
     let heard = '';
     for (let i = 0; i < e.results.length; i++) heard += e.results[i][0].transcript;
     speech.heardLength = heard.length;
-    moveTo(Matcher.follow(state.norm, state.pos, Matcher.normalize(heard.slice(speech.offset))));
+    moveTo(Matcher.follow(state.norm, state.pos, Matcher.spoken(heard.slice(speech.offset))));
   };
   rec.onerror = e => {
     if (['not-allowed', 'service-not-allowed', 'audio-capture'].includes(e.error)) {
@@ -646,7 +658,7 @@ async function findLenses() {
 }
 function showCamInfo() {
   const cam = $('cam');
-  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v11`;
+  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v12`;
 }
 async function openCamera() {
   stopCamera();

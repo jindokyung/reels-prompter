@@ -7,12 +7,60 @@
     return String(text).toLowerCase().replace(/[^0-9a-z가-힣]/g, '');
   }
 
+  // 숫자를 읽는 소리로 바꾼다. 대본의 "3가지"와 받아쓴 "세 가지"가 같아진다.
+  const NATIVE1 = ['', '한', '두', '세', '네', '다섯', '여섯', '일곱', '여덟', '아홉'];
+  const NATIVE10 = ['', '열', '스물', '서른', '마흔', '쉰', '예순', '일흔', '여든', '아흔'];
+  const SINO = ['', '일', '이', '삼', '사', '오', '육', '칠', '팔', '구'];
+  const COUNTER = /^\s*(가지|개|번|명|살|시|달|마리|잔|장|병|군데)/;
+  const native = n => (n === 20 ? '스무' : NATIVE10[Math.floor(n / 10)] + NATIVE1[n % 10]);
+  function sinoSmall(n) {
+    let out = '';
+    [[1000, '천'], [100, '백'], [10, '십']].forEach(([unit, name]) => {
+      const d = Math.floor(n / unit) % 10;
+      if (d) out += (d > 1 ? SINO[d] : '') + name;
+    });
+    return out + SINO[n % 10];
+  }
+  function sino(n) {
+    if (n === 0) return '영';
+    const eok = Math.floor(n / 1e8), man = Math.floor((n % 1e8) / 1e4);
+    return (eok ? sinoSmall(eok) + '억' : '') + (man ? (man === 1 ? '' : sinoSmall(man)) + '만' : '') + sinoSmall(n % 1e4);
+  }
+  function spoken(text) {
+    const read = String(text).replace(/%/g, '퍼센트').replace(/\d[\d,]*(\.\d+)?/g, (match, dec, offset, all) => {
+      const n = parseInt(match.replace(/,/g, ''), 10);
+      if (!Number.isSafeInteger(n)) return match;
+      if (dec) return sino(n) + '점' + [...dec.slice(1)].map(d => SINO[+d] || '영').join('');
+      const after = all.slice(offset + match.length);
+      if (n > 0 && n < 100 && /^\s*번째/.test(after)) return n === 1 ? '첫' : native(n);
+      if (n > 0 && n < 100 && COUNTER.test(after)) return native(n);
+      return sino(n);
+    });
+    return normalize(read);
+  }
+
+  // 받아쓰기는 비슷한 소리로 틀리는 일이 많아, 소리가 가까우면 작은 차이로만 친다.
+  const CHO = [0, 0, 2, 3, 3, 5, 6, 7, 7, 9, 9, 11, 12, 12, 12, 0, 3, 7, 18];
+  const JUNG = [0, 1, 2, 3, 4, 1, 6, 3, 8, 9, 10, 10, 12, 13, 14, 10, 16, 17, 18, 19, 20];
+  const JONG = [0, 1, 1, 1, 4, 4, 4, 7, 8, 1, 16, 8, 8, 8, 17, 8, 16, 17, 17, 7, 7, 21, 7, 7, 1, 7, 17, 7];
+  function soundCost(a, b) {
+    if (a === b) return 0;
+    const x = a.charCodeAt(0) - 0xAC00, y = b.charCodeAt(0) - 0xAC00;
+    if (x < 0 || x > 11171 || y < 0 || y > 11171) return 1;
+    const part = (u, v, group, near, far) => (u === v ? 0 : group[u] === group[v] ? near : far);
+    const cost =
+      part(Math.floor(x / 588), Math.floor(y / 588), CHO, 0.12, 0.45) +
+      part(Math.floor((x % 588) / 28), Math.floor((y % 588) / 28), JUNG, 0.1, 0.4) +
+      part(x % 28, y % 28, JONG, 0.05, 0.2);
+    return Math.min(1, cost);
+  }
+
   function distance(a, b) {
     let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
     for (let i = 1; i <= a.length; i++) {
       const cur = [i];
       for (let j = 1; j <= b.length; j++) {
-        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + soundCost(a[i - 1], b[j - 1]));
       }
       prev = cur;
     }
@@ -134,7 +182,7 @@
     return best;
   }
 
-  const api = { normalize, follow, splitChunks, createPacer, snapToBoundary };
+  const api = { normalize, spoken, follow, splitChunks, createPacer, snapToBoundary };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Matcher = api;
 })(typeof window !== 'undefined' ? window : globalThis);

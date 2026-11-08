@@ -107,7 +107,14 @@
   #record.on i { width: 28px; height: 28px; border-radius: 6px; }
 
   #review { position: absolute; inset: 0; background: #000; }
-  #review #replay { height: calc(100% - var(--safe-b) - 84px); object-fit: contain; }
+  #review #replay { height: calc(100% - var(--safe-b) - 146px); object-fit: contain; }
+  #editBar, #editDone { position: absolute; left: 12px; right: 12px; bottom: calc(var(--safe-b) + 82px); height: 54px; display: flex; align-items: center; gap: 6px; }
+  .opt { flex: 1 1 0; min-width: 0; height: 44px; border-radius: 10px; background: rgba(40,40,48,.92); color: var(--muted); font-size: 13px; line-height: 1.15; padding: 0 2px; }
+  .opt.on { background: rgba(255,226,122,.18); color: var(--now); box-shadow: inset 0 0 0 1px var(--now); font-weight: 700; }
+  #autoEdit { flex: 1.5 1 0; min-width: 0; height: 44px; border-radius: 10px; background: #fff; color: #111; font-weight: 700; font-size: 15px; }
+  #editDone { justify-content: space-between; color: var(--muted); font-size: 14px; }
+  #clipToggle { min-height: 44px; padding: 0 14px; border-radius: 10px; background: rgba(40,40,48,.92); color: var(--text); font-size: 14px; }
+  #renderView { max-width: 100%; max-height: 52dvh; border-radius: 12px; background: #000; }
   #reviewBar { position: absolute; left: 12px; right: 12px; bottom: calc(var(--safe-b) + 14px); display: grid; grid-template-columns: 1fr 1.6fr; gap: 10px; }
   #retake { height: 56px; border-radius: 14px; background: rgba(40,40,48,.92); font-weight: 600; }
 
@@ -232,6 +239,16 @@
 
   <div id="review" hidden>
     <video id="replay" controls playsinline></video>
+    <div id="editBar">
+      <button class="opt on" data-opt="cut" type="button">무음·NG<br>자르기</button>
+      <button class="opt on" data-opt="captions" type="button">자막</button>
+      <button class="opt on" data-opt="title" type="button">제목</button>
+      <button id="autoEdit" type="button">자동 편집</button>
+    </div>
+    <div id="editDone" hidden>
+      <span id="editInfo"></span>
+      <button id="clipToggle" type="button">원본 보기</button>
+    </div>
     <div id="reviewBar">
       <button id="retake" type="button">다시 찍기</button>
       <button id="save" class="primary" type="button">영상 저장</button>
@@ -242,12 +259,14 @@
 <div id="toast" role="status" hidden></div>
 <div id="busy" role="status" hidden>
   <div id="busyText"></div>
-  <small>보통 30초에서 1분쯤 걸려요</small>
+  <canvas id="renderView" hidden></canvas>
+  <small id="busyNote"></small>
   <button id="cancel" type="button">취소</button>
 </div>
 
 <script src="matcher.js"></script>
 <script src="ai.js"></script>
+<script src="edit.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const store = {
@@ -265,7 +284,7 @@ const state = {
   mode: store.get('mode', 'voice'), font: store.get('font', 28), speed: store.get('speed', 6),
   facing: 'user', phase: 'idle', pos: 0, norm: '', chunks: [], current: -1, saved: true,
 };
-let stream, recorder, chunks = [], recStart = 0, timerId, autoFrame, wakeLock, countToken = 0, blobUrl, savedFile;
+let replayUrl = '', stream, recorder, chunks = [], recStart = 0, timerId, autoFrame, wakeLock, countToken = 0, blobUrl, savedFile;
 
 function toast(msg, ms = 3800) {
   const t = $('toast');
@@ -316,6 +335,7 @@ function paint() {
   const i = currentChunk();
   if (i === state.current) return;
   state.current = i;
+  if (state.phase === 'rec') state.timeline.push({ i, t: (Date.now() - recStart) / 1000 });
   const text = n => (state.chunks[n] ? state.chunks[n].text : '');
   $('prev').textContent = text(i - 1);
   $('now').textContent = text(i);
@@ -493,6 +513,7 @@ async function beginRecording() {
   recorder.onstop = finishRecording;
   recorder.start(1000);
   recStart = Date.now();
+  state.timeline = [{ i: state.current, t: 0 }];
   setPhase('rec');
   $('timer').textContent = '00:00';
   timerId = setInterval(() => {
@@ -522,9 +543,12 @@ function finishRecording() {
   const blob = new Blob(chunks, { type });
   const d = new Date(), p = n => String(n).padStart(2, '0');
   const name = `릴스_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${type.includes('mp4') ? 'mp4' : 'webm'}`;
+  state.recSec = (Date.now() - recStart) / 1000;
   savedFile = new File([blob], name, { type: type.split(';')[0] }); // 아이폰 공유는 코덱 표기가 붙으면 거부될 수 있다
   if (blobUrl) URL.revokeObjectURL(blobUrl);
   blobUrl = URL.createObjectURL(blob);
+  replayUrl = blobUrl;
+  resetEdit(savedFile, blobUrl);
   $('replay').src = blobUrl + '#t=0.001'; // 재생 전에도 첫 장면이 보이게
   state.saved = false;
   setPhase('review');
@@ -547,7 +571,7 @@ async function saveVideo() {
     }
   }
   const a = document.createElement('a');
-  a.href = blobUrl; a.download = savedFile.name;
+  a.href = replayUrl; a.download = savedFile.name;
   document.body.append(a); a.click(); a.remove();
   state.saved = true;
   toast('영상을 내려받았어요.');
@@ -556,6 +580,7 @@ $('save').onclick = saveVideo;
 $('retake').onclick = () => {
   if (!state.saved && !confirm('저장하지 않은 영상은 사라져요. 다시 찍을까요?')) return;
   $('replay').pause(); $('replay').removeAttribute('src'); $('replay').load();
+  resetEdit(null, '');
   setPhase('idle');
   buildScript(false);
 };
@@ -624,6 +649,7 @@ async function withAI(label, work) {
   if (!key) { showView('planner'); renderKey(true); toast('먼저 API 키를 넣어 주세요.'); return; }
   const abort = planner.abort = new AbortController();
   $('busyText').textContent = label;
+  $('busyNote').textContent = '보통 30초에서 1분쯤 걸려요';
   $('busy').hidden = false;
   try {
     await work(key, abort.signal);
@@ -635,7 +661,7 @@ async function withAI(label, work) {
     planner.abort = null;
   }
 }
-$('cancel').onclick = () => { if (planner.abort) planner.abort.abort(); };
+$('cancel').onclick = () => { if (planner.abort) planner.abort.abort(); if (edit.abort) edit.abort.abort(); };
 
 function renderIdeas() {
   const list = $('ideaList');
@@ -732,6 +758,95 @@ renderKey(false);
 renderSecs();
 renderIdeas();
 renderPlan();
+
+/* 자동 편집 */
+const edit = { original: null, originalUrl: '', edited: null, editedUrl: '', showing: 'original', abort: null, opts: { cut: true, captions: true, title: true } };
+
+function showClip(which) {
+  edit.showing = which;
+  const file = which === 'edited' ? edit.edited : edit.original;
+  const url = which === 'edited' ? edit.editedUrl : edit.originalUrl;
+  savedFile = file;
+  replayUrl = url;
+  $('replay').src = url + '#t=0.001';
+  $('clipToggle').textContent = which === 'edited' ? '원본 보기' : '편집본 보기';
+}
+function renderOpts() {
+  document.querySelectorAll('[data-opt]').forEach(b => {
+    const on = edit.opts[b.dataset.opt];
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+}
+function resetEdit(file, url) {
+  if (edit.editedUrl) URL.revokeObjectURL(edit.editedUrl);
+  edit.original = file; edit.originalUrl = url;
+  edit.edited = null; edit.editedUrl = ''; edit.showing = 'original';
+  $('editBar').hidden = false;
+  $('editDone').hidden = true;
+  // 제목은 AI가 기획한 대본에만 있다.
+  const hasTitle = !!(planner.current && planner.current.title);
+  document.querySelector('[data-opt="title"]').hidden = !hasTitle;
+  renderOpts();
+}
+document.querySelectorAll('[data-opt]').forEach(b => {
+  b.onclick = () => { edit.opts[b.dataset.opt] = !edit.opts[b.dataset.opt]; renderOpts(); };
+});
+$('clipToggle').onclick = () => showClip(edit.showing === 'edited' ? 'original' : 'edited');
+
+const SMALL_ENOUGH_TO_ANALYZE = 400 * 1024 * 1024;
+
+async function readEnvelope(job) {
+  if (edit.original.size > SMALL_ENOUGH_TO_ANALYZE) return null;
+  try {
+    const audio = await job.ctx.decodeAudioData(await edit.original.arrayBuffer());
+    return AutoEdit.envelope(audio.getChannelData(0), audio.sampleRate);
+  } catch { return null; }
+}
+
+$('autoEdit').onclick = async () => {
+  const hasTitle = !document.querySelector('[data-opt="title"]').hidden;
+  const { cut, captions } = edit.opts;
+  const title = hasTitle && edit.opts.title ? planner.current.title : '';
+  if (!cut && !captions && !title) { toast('자를지, 자막이나 제목을 넣을지 하나는 골라 주세요.'); return; }
+
+  const job = AutoEdit.prepare(edit.originalUrl); // 버튼을 누른 순간에 시작해야 아이폰에서 소리가 난다
+  const abort = edit.abort = new AbortController();
+  $('replay').pause();
+  $('busyText').textContent = '소리를 살펴보는 중이에요';
+  $('busyNote').textContent = '화면을 켜 두고 잠시 기다려 주세요';
+  $('renderView').hidden = false;
+  $('busy').hidden = false;
+  try {
+    const env = cut ? await readEnvelope(job) : null;
+    if (abort.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const plan = AutoEdit.planEdit({
+      env, duration: state.recSec, timeline: state.timeline,
+      texts: state.chunks.map(c => c.text), cut, captions,
+    });
+    const blob = await AutoEdit.render({
+      job, plan, title, format: pickFormat(), canvas: $('renderView'), signal: abort.signal,
+      onProgress: p => { $('busyText').textContent = `편집하는 중이에요 ${Math.round(p * 100)}%`; },
+    });
+    const type = blob.type.split(';')[0];
+    const name = edit.original.name.replace(/\.[^.]+$/, '') + `_편집.${type.includes('mp4') ? 'mp4' : 'webm'}`;
+    if (edit.editedUrl) URL.revokeObjectURL(edit.editedUrl);
+    edit.edited = new File([blob], name, { type });
+    edit.editedUrl = URL.createObjectURL(blob);
+    state.saved = false;
+    $('editBar').hidden = true;
+    $('editDone').hidden = false;
+    $('editInfo').textContent = `${Math.round(state.recSec)}초 → ${Math.round(plan.duration)}초` + (cut && !env ? ' · 무음은 못 잘랐어요' : '');
+    showClip('edited');
+  } catch (err) {
+    if (err && err.name !== 'AbortError') toast('편집하지 못했어요. 원본은 그대로 있어요.', 7000);
+  } finally {
+    AutoEdit.dispose(job);
+    $('renderView').hidden = true;
+    $('busy').hidden = true;
+    edit.abort = null;
+  }
+};
 </script>
 </body>
 </html>

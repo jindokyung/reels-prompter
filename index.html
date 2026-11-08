@@ -278,7 +278,7 @@ const store = {
 };
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const HINTS = {
-  voice: '읽는 대로 넘어가요 · 위아래 줄을 눌러 옮겨요',
+  voice: '녹화를 시작하면 읽는 대로 넘어가요 · 위아래 줄을 눌러 옮겨요',
   auto: '일정한 빠르기로 넘어가요 · 위아래 줄을 눌러 옮겨요',
   hand: '아랫줄을 누르면 다음, 윗줄을 누르면 이전',
 };
@@ -383,16 +383,64 @@ $('speedUp').onclick = step('speed', 0.5, 2, 12);
 /* 음성으로 따라가기 */
 const speech = { rec: null, active: false, failures: 0, heardLength: 0, offset: 0 };
 const speechApi = () => window.SpeechRecognition || window.webkitSpeechRecognition;
-function fallbackToAuto(msg) {
+function fallbackToLevel(msg) {
   stopSpeech();
-  setMode('auto', false);
+  if (level.an) startLevel();
+  else setMode('auto', false);
   toast(msg);
+}
+
+/* 음성인식을 쓸 수 없을 때: 녹화 중인 마이크 소리로 말하는 때와 빠르기를 읽어 넘긴다 */
+const level = { ctx: null, an: null, timer: 0 };
+const isAndroid = () => /Android/i.test(navigator.userAgent);
+function armLevel() { // 아이폰·갤럭시는 버튼을 누른 순간에만 오디오를 켤 수 있다
+  if (level.ctx || !stream) return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    level.ctx = new Ctx();
+    level.ctx.resume();
+    level.an = level.ctx.createAnalyser();
+    level.an.fftSize = 1024;
+    level.ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks())).connect(level.an);
+  } catch { level.ctx = null; level.an = null; }
+}
+function startLevel() {
+  if (level.timer || !level.an) return;
+  const pacer = Matcher.createPacer();
+  const buf = new Float32Array(level.an.fftSize);
+  let last = performance.now(), carry = 0, wasTalking = false;
+  level.timer = setInterval(() => {
+    const now = performance.now();
+    const dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    level.an.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    const r = pacer(20 * Math.log10(Math.max(Math.sqrt(sum / buf.length), 1e-6)), dt);
+    carry += r.advance;
+    if (carry >= 1) { const n = Math.floor(carry); carry -= n; moveTo(state.pos + n); }
+    if (r.talking) wasTalking = true;
+    else if (wasTalking && r.quietFor >= 0.35) {
+      wasTalking = false;
+      carry = 0;
+      moveTo(Matcher.snapToBoundary(state.chunks, state.pos));
+    }
+  }, 20);
+}
+function stopLevel() {
+  clearInterval(level.timer);
+  level.timer = 0;
+  if (level.ctx) level.ctx.close().catch(() => {});
+  level.ctx = null; level.an = null;
 }
 function startSpeech() {
   const Api = speechApi();
   if (!Api) return;
-  speech.active = true; speech.failures = 0; speech.heardLength = 0; speech.offset = 0;
+  speech.active = true; speech.failures = 0; speech.heardLength = 0; speech.offset = 0; speech.gotResult = false;
   runSpeech(Api);
+  speech.watchdog = setTimeout(() => {
+    if (speech.active && !speech.gotResult) fallbackToLevel('음성인식이 안 들려서 목소리 크기로 따라갈게요.');
+  }, 7000);
 }
 function runSpeech(Api) {
   const rec = new Api();
@@ -400,6 +448,7 @@ function runSpeech(Api) {
   rec.lang = 'ko-KR'; rec.continuous = true; rec.interimResults = true;
   rec.onresult = e => {
     speech.failures = 0;
+    speech.gotResult = true;
     let heard = '';
     for (let i = 0; i < e.results.length; i++) heard += e.results[i][0].transcript;
     speech.heardLength = heard.length;
@@ -407,14 +456,14 @@ function runSpeech(Api) {
   };
   rec.onerror = e => {
     if (['not-allowed', 'service-not-allowed', 'audio-capture'].includes(e.error)) {
-      fallbackToAuto('이 폰에서는 음성 따라가기가 안 돼서 자동 넘김으로 바꿨어요.');
+      fallbackToLevel('음성인식이 안 돼서 목소리 크기로 따라갈게요.');
     } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
       speech.failures++;
     }
   };
   rec.onend = () => {
     if (!speech.active) return;
-    if (speech.failures >= 4) { fallbackToAuto('음성인식이 자꾸 끊겨서 자동 넘김으로 바꿨어요.'); return; }
+    if (speech.failures >= 4) { fallbackToLevel('음성인식이 자꾸 끊겨서 목소리 크기로 따라갈게요.'); return; }
     speech.heardLength = 0; speech.offset = 0;
     setTimeout(() => { if (speech.active) runSpeech(Api); }, 150);
   };
@@ -422,6 +471,7 @@ function runSpeech(Api) {
 }
 function stopSpeech() {
   speech.active = false;
+  clearTimeout(speech.watchdog);
   if (speech.rec) { try { speech.rec.abort(); } catch {} speech.rec = null; }
 }
 
@@ -540,7 +590,8 @@ async function countdown() {
 async function beginRecording() {
   const format = pickFormat();
   if (format === null) { toast('이 브라우저는 녹화를 지원하지 않아요.'); return; }
-  if (!(await countdown())) return;
+  if (state.mode === 'voice') armLevel();
+  if (!(await countdown())) { stopLevel(); return; }
   chunks = [];
   try {
     recorder = new MediaRecorder(stream, { ...(format ? { mimeType: format } : {}), videoBitsPerSecond: 8000000 });
@@ -559,23 +610,26 @@ async function beginRecording() {
     $('timer').textContent = `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
   }, 250);
   runAuto();
-  if (state.mode === 'voice') startSpeech();
+  // 갤럭시 크롬은 녹화와 음성인식이 마이크를 두고 충돌한다.
+  if (state.mode === 'voice') { if (isAndroid() || !speechApi()) startLevel(); else startSpeech(); }
   // 음성인식이 마이크를 뺏어 영상 소리가 끊기면, 소리를 지키는 쪽을 택한다.
   const mic = stream.getAudioTracks()[0];
   if (mic) mic.onmute = () => {
-    if (state.phase === 'rec' && speech.active) fallbackToAuto('영상 소리를 지키려고 자동 넘김으로 바꿨어요.');
+    if (state.phase === 'rec' && speech.active) fallbackToLevel('영상 소리를 지키려고 목소리 크기로 따라갈게요.');
   };
 }
 function endRecording() {
   clearInterval(timerId);
   clearInterval(autoFrame);
   stopSpeech();
+  stopLevel();
   if (recorder && recorder.state !== 'inactive') recorder.stop();
 }
 function finishRecording() {
   clearInterval(timerId);
   clearInterval(autoFrame);
   stopSpeech();
+  stopLevel();
   if (!chunks.length) { setPhase('idle'); toast('녹화된 내용이 없어요. 다시 찍어 주세요.'); return; }
   const type = recorder.mimeType || (chunks[0] && chunks[0].type) || 'video/mp4';
   const blob = new Blob(chunks, { type });
@@ -626,7 +680,6 @@ $('retake').onclick = () => {
 /* 화면 전환 */
 $('start').onclick = async () => {
   $('editor').hidden = true; $('stage').hidden = false;
-  if (state.mode === 'voice' && !speechApi()) { setMode('auto', false); toast('이 브라우저는 음성 따라가기를 지원하지 않아 자동 넘김으로 시작해요.'); }
   applySettings();
   setPhase('idle');
   buildScript(false);

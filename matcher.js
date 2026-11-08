@@ -74,7 +74,67 @@
     return out.filter(c => normalize(c));
   }
 
-  const api = { normalize, follow, splitChunks };
+  // 마이크 소리 크기(dB)만으로 말하는지와 말 빠르기를 읽는다. 한국어는 음절 하나가 글자 하나라 음절 수로 따라갈 수 있다.
+  function createPacer() {
+    const DIP = 2.5, MIN_GAP = 0.09, HANG = 0.22, RECENT_PEAK = 0.6, WINDOW = 2;
+    let floor = null, smooth = null, now = 0, voiced = 0;
+    let quietFor = 0, speaking = false, lastPeak = -10;
+    let up = true, maxV = -100, minV = 0, rate = 6;
+    const peaks = [];
+
+    return function step(db, dt) {
+      now += dt;
+      if (floor === null) { floor = db; smooth = db; }
+      smooth += (db - smooth) * 0.5;
+      const on = floor + 10, off = floor + 6;
+      const recent = now - lastPeak < RECENT_PEAK;
+
+      if (db < floor) floor += (db - floor) * 0.2;
+      else if (!recent) floor += dt * 1.5; // 일정한 소음에는 적응한다
+
+      if (smooth > on) { speaking = true; quietFor = 0; }
+      else if (smooth < off) { quietFor += dt; if (quietFor >= HANG) speaking = false; }
+
+      if (up) {
+        if (smooth > maxV) maxV = smooth;
+        if (smooth < maxV - DIP) {
+          if (maxV > on && now - lastPeak >= MIN_GAP) {
+            lastPeak = now;
+            peaks.push(voiced);
+          }
+          up = false; minV = smooth;
+        }
+      } else {
+        if (smooth < minV) minV = smooth;
+        if (smooth > minV + DIP) { up = true; maxV = smooth; }
+      }
+
+      const talking = speaking && now - lastPeak < RECENT_PEAK;
+      if (talking) {
+        voiced += dt;
+        while (peaks.length && peaks[0] < voiced - WINDOW) peaks.shift();
+        if (voiced > 0.6) {
+          const measured = peaks.length / Math.min(WINDOW, voiced);
+          const target = Math.min(9, Math.max(4, measured));
+          rate += (target - rate) * Math.min(1, dt * 1.5);
+        }
+      }
+      return { advance: talking ? rate * dt : 0, talking, quietFor };
+    };
+  }
+
+  // 말을 멈춘 순간은 대개 줄이 끝난 곳이다. 가까운 줄 경계로 맞춰 쌓인 오차를 없앤다.
+  function snapToBoundary(chunks, pos) {
+    let best = pos, bestDist = Infinity;
+    for (const c of chunks) {
+      const tolerance = Math.max(3, Math.ceil((c.end - c.start) * 0.4));
+      const dist = Math.abs(c.end - pos);
+      if (dist <= tolerance && dist < bestDist) { best = c.end; bestDist = dist; }
+    }
+    return best;
+  }
+
+  const api = { normalize, follow, splitChunks, createPacer, snapToBoundary };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Matcher = api;
 })(typeof window !== 'undefined' ? window : globalThis);

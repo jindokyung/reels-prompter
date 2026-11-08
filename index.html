@@ -88,6 +88,7 @@
   #next { font-size: .78em; color: rgba(255,255,255,.72); }
   #hint { text-align: center; padding: 7px 16px 10px; font-size: 13px; color: rgba(255,255,255,.72); border-top: 1px solid rgba(255,255,255,.1); }
 
+  #camInfo { position: absolute; right: 12px; bottom: calc(var(--safe-b) + 170px); font-size: 11px; color: rgba(255,255,255,.55); font-variant-numeric: tabular-nums; }
   #timer { position: absolute; left: 50%; transform: translateX(-50%); bottom: calc(var(--safe-b) + 118px);
     padding: 4px 12px; border-radius: 999px; background: rgba(0,0,0,.55); font-size: 15px; font-variant-numeric: tabular-nums; }
   #timer::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 7px; border-radius: 50%; background: var(--rec); vertical-align: 1px; }
@@ -210,6 +211,7 @@
     <div id="hint"></div>
   </div>
 
+  <div id="camInfo" aria-hidden="true"></div>
   <div id="timer" hidden>00:00</div>
   <div id="count" hidden></div>
 
@@ -448,7 +450,8 @@ async function openCamera() {
   }
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: state.facing, width: { ideal: 1080 }, height: { ideal: 1920 }, frameRate: { ideal: 30 } },
+      // 세로 크기로 요청하면 안드로이드가 가로 화면의 가운데만 잘라 확대한다. 원본 비율로 받으면 폰 방향에 맞게 돌려 준다.
+      video: { facingMode: state.facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 }, resizeMode: 'none' },
       audio: { echoCancellation: true, noiseSuppression: true },
     });
   } catch (err) {
@@ -457,6 +460,7 @@ async function openCamera() {
   }
   const cam = $('cam');
   cam.classList.toggle('mirror', state.facing === 'user');
+  cam.onresize = cam.onloadedmetadata = () => { $('camInfo').textContent = `카메라 ${cam.videoWidth}×${cam.videoHeight}`; };
   cam.srcObject = stream;
   cam.play().catch(() => {});
   return true;
@@ -481,6 +485,7 @@ function setPhase(phase) {
   state.phase = phase;
   const busy = phase === 'count' || phase === 'rec';
   $('settings').hidden = busy;
+  $('camInfo').hidden = busy;
   $('back').style.visibility = busy ? 'hidden' : 'visible';
   $('flip').style.visibility = busy ? 'hidden' : 'visible';
   $('timer').hidden = phase !== 'rec';

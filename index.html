@@ -222,6 +222,7 @@
         <button data-mode="auto" type="button">자동</button>
         <button data-mode="hand" type="button">수동</button>
       </div>
+      <div class="chip"><button id="camMode" type="button">화각</button></div>
       <div class="chip" role="group" aria-label="글자 크기">
         <button id="fontDown" type="button" aria-label="글자 작게">가−</button>
         <button id="fontUp" type="button" aria-label="글자 크게">가+</button>
@@ -442,27 +443,59 @@ function stopCamera() {
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null; $('cam').srcObject = null;
 }
+/* 폰마다 카메라가 달라서 화각을 골라 쓸 수 있게 한다. 앞의 셋은 요청 방식, 뒤는 그 방향의 다른 렌즈. */
+const SIZE_16_9 = { width: { ideal: 1920 }, height: { ideal: 1080 }, resizeMode: 'none' };
+const BASE_CAM_MODES = [
+  { size: SIZE_16_9 },
+  { size: { width: { ideal: 1600 }, height: { ideal: 1200 }, resizeMode: 'none' } },
+  { size: {} },
+];
+let camModes = BASE_CAM_MODES;
+state.camMode = store.get('camMode', 0);
+
+function requestFor(mode) {
+  const where = mode.deviceId ? { deviceId: { exact: mode.deviceId } } : { facingMode: state.facing };
+  return { ...where, frameRate: { ideal: 30 }, ...mode.size };
+}
+async function findLenses() {
+  try {
+    const word = state.facing === 'user' ? /front|전면/i : /back|rear|후면/i;
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput' && word.test(d.label));
+    camModes = [...BASE_CAM_MODES, ...devices.map(d => ({ deviceId: d.deviceId, size: SIZE_16_9 }))];
+  } catch { camModes = BASE_CAM_MODES; }
+}
+function showCamInfo() {
+  const cam = $('cam');
+  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight}`;
+}
 async function openCamera() {
   stopCamera();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     toast('이 주소에서는 카메라를 쓸 수 없어요. https 주소로 열어 주세요.');
     return false;
   }
+  if (state.camMode >= camModes.length) state.camMode = 0;
+  const audio = { echoCancellation: true, noiseSuppression: true };
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      // 세로 크기로 요청하면 안드로이드가 가로 화면의 가운데만 잘라 확대한다. 원본 비율로 받으면 폰 방향에 맞게 돌려 준다.
-      video: { facingMode: state.facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 }, resizeMode: 'none' },
-      audio: { echoCancellation: true, noiseSuppression: true },
-    });
+    stream = await navigator.mediaDevices.getUserMedia({ video: requestFor(camModes[state.camMode]), audio });
   } catch (err) {
-    toast(err && err.name === 'NotAllowedError' ? '카메라와 마이크를 허용해 주세요.' : '카메라를 열지 못했어요.');
+    if (err && err.name === 'NotAllowedError') { toast('카메라와 마이크를 허용해 주세요.'); return false; }
+    if (state.camMode !== 0) { // 저장해 둔 화각을 못 쓰면 기본으로 돌아간다
+      state.camMode = 0;
+      store.set('camMode', 0);
+      toast('이 화각은 쓸 수 없어서 기본으로 돌아왔어요.');
+      return openCamera();
+    }
+    toast('카메라를 열지 못했어요.');
     return false;
   }
+  await findLenses();
   const cam = $('cam');
   cam.classList.toggle('mirror', state.facing === 'user');
-  cam.onresize = cam.onloadedmetadata = () => { $('camInfo').textContent = `카메라 ${cam.videoWidth}×${cam.videoHeight}`; };
+  cam.onresize = cam.onloadedmetadata = showCamInfo;
   cam.srcObject = stream;
   cam.play().catch(() => {});
+  showCamInfo();
   return true;
 }
 async function keepAwake() {
@@ -606,6 +639,13 @@ $('back').onclick = () => {
 };
 $('flip').onclick = async () => {
   state.facing = state.facing === 'user' ? 'environment' : 'user';
+  state.camMode = 0;
+  camModes = BASE_CAM_MODES;
+  await openCamera();
+};
+$('camMode').onclick = async () => {
+  state.camMode = (state.camMode + 1) % camModes.length;
+  store.set('camMode', state.camMode);
   await openCamera();
 };
 

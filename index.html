@@ -141,6 +141,11 @@
     <input id="keyInput" class="field" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-로 시작하는 키" aria-label="API 키">
     <button id="keySave" class="primary" type="button">저장</button>
     <button id="keyDelete" class="link" type="button" hidden>이 폰에서 키 지우기</button>
+    <h2 style="margin-top:8px">음성인식 연결</h2>
+    <p><a href="https://console.deepgram.com" target="_blank" rel="noopener">console.deepgram.com</a>에서 API 키를 만들어 넣으면 읽는 말을 알아듣고 대본이 따라와요. <span id="dgStatus"></span></p>
+    <input id="dgInput" class="field" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Deepgram API 키" aria-label="Deepgram API 키">
+    <button id="dgSave" class="sub2" type="button">음성인식 키 저장</button>
+    <button id="dgDelete" class="link" type="button" hidden>음성인식 키 지우기</button>
   </section>
 
   <section class="card">
@@ -269,9 +274,9 @@
   <button id="cancel" type="button">취소</button>
 </div>
 
-<script src="matcher.js?v=9"></script>
-<script src="ai.js?v=9"></script>
-<script src="edit.js?v=9"></script>
+<script src="matcher.js?v=10"></script>
+<script src="ai.js?v=10"></script>
+<script src="edit.js?v=10"></script>
 <script>
 const $ = id => document.getElementById(id);
 const store = {
@@ -441,6 +446,70 @@ function stopLevel() {
   if (level.ctx) level.ctx.close().catch(() => {});
   level.ctx = null; level.an = null;
 }
+/* 진짜 음성인식: 녹화 중인 마이크 소리를 Deepgram으로 보내 받아쓴 글자로 대본 위치를 맞춘다 */
+const dg = { ws: null, rec: null, queue: [], finals: '', got: false, closing: false, levelWait: 0 };
+const dgKey = () => store.get('deepgramKey', '');
+const DG_FORMAT = 'audio/webm;codecs=opus';
+function connectDeepgram() {
+  if (!dgKey() || !window.MediaRecorder || !MediaRecorder.isTypeSupported(DG_FORMAT) || !stream) return;
+  const params = new URLSearchParams({ model: 'nova-3', language: 'ko', interim_results: 'true', smart_format: 'false', punctuate: 'false' });
+  Object.assign(dg, { queue: [], finals: '', got: false, closing: false });
+  const ws = dg.ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, ['token', dgKey()]);
+  ws.onopen = () => { dg.queue.forEach(c => ws.send(c)); dg.queue = []; };
+  ws.onmessage = e => handleTranscript(e.data);
+  ws.onclose = () => { if (!dg.closing) deepgramFailed(); };
+}
+function handleTranscript(data) {
+  let m;
+  try { m = JSON.parse(data); } catch { return; }
+  if (m.type !== 'Results' || state.phase !== 'rec') return;
+  const text = m.channel.alternatives[0].transcript || '';
+  if (m.is_final) dg.finals += text + ' ';
+  const heard = m.is_final ? dg.finals : dg.finals + text;
+  if (!heard.trim()) return;
+  const first = !dg.got;
+  if (first) {
+    dg.got = true;
+    clearTimeout(dg.levelWait);
+    clearInterval(level.timer); level.timer = 0;
+    $('voiceInfo').textContent = '음성인식으로 따라가는 중';
+  }
+  speech.heardLength = heard.length;
+  const spoken = Matcher.normalize(heard.slice(speech.offset));
+  // 처음 알아들었을 때는 소리로 앞서간 만큼을 바로잡도록 처음부터 찾는다.
+  const next = Matcher.follow(state.norm, first ? 0 : state.pos, spoken);
+  if (!first || next > 0) moveTo(next);
+}
+function startDeepgramAudio() {
+  speech.offset = 0; speech.heardLength = 0;
+  const rec = dg.rec = new MediaRecorder(new MediaStream(stream.getAudioTracks()), { mimeType: DG_FORMAT });
+  rec.ondataavailable = e => {
+    if (!e.data || !e.data.size) return;
+    if (dg.ws && dg.ws.readyState === WebSocket.OPEN) dg.ws.send(e.data);
+    else dg.queue.push(e.data);
+  };
+  rec.start(200);
+  $('voiceInfo').textContent = '음성인식 연결 중';
+  dg.levelWait = setTimeout(() => { if (!dg.got) startLevel(); }, 3000);
+}
+function stopDeepgram() {
+  dg.closing = true;
+  clearTimeout(dg.levelWait);
+  if (dg.rec && dg.rec.state !== 'inactive') dg.rec.stop();
+  dg.rec = null;
+  const ws = dg.ws;
+  dg.ws = null;
+  if (ws) {
+    try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'CloseStream' })); ws.close(); } catch {}
+  }
+}
+function deepgramFailed() {
+  const hadWords = dg.got;
+  stopDeepgram();
+  if (state.phase === 'rec') startLevel(); // 카운트 중이면 녹화가 시작될 때 소리 따라가기로 시작된다
+  if (state.phase === 'rec' || state.phase === 'count') toast(hadWords ? '음성인식이 끊겨서 소리로 따라갈게요.' : '음성인식에 연결하지 못했어요. 키와 인터넷을 확인해 주세요. 지금은 소리로 따라갈게요.', 7000);
+}
+
 // 최신 크롬은 녹화 중인 마이크를 음성인식에 그대로 넘길 수 있어 충돌이 없다.
 let trackSpeech = store.get('trackSpeech', null);
 function detectTrackSpeech() {
@@ -454,7 +523,9 @@ function detectTrackSpeech() {
 }
 function startFollowing() {
   try {
-    if (isAndroid() || !speechApi()) {
+    if (dg.ws) {
+      startDeepgramAudio();
+    } else if (isAndroid() || !speechApi()) {
       if (!level.an) throw new Error('no microphone analyser');
       startLevel();
       const track = stream.getAudioTracks()[0];
@@ -554,7 +625,7 @@ async function findLenses() {
 }
 function showCamInfo() {
   const cam = $('cam');
-  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v9`;
+  $('camInfo').textContent = `화각 ${state.camMode + 1}/${camModes.length} · ${cam.videoWidth}×${cam.videoHeight} · v10`;
 }
 async function openCamera() {
   stopCamera();
@@ -629,8 +700,8 @@ async function countdown() {
 async function beginRecording() {
   const format = pickFormat();
   if (format === null) { toast('이 브라우저는 녹화를 지원하지 않아요.'); return; }
-  if (state.mode === 'voice') armLevel();
-  if (!(await countdown())) { stopLevel(); return; }
+  if (state.mode === 'voice') { armLevel(); connectDeepgram(); }
+  if (!(await countdown())) { stopLevel(); stopDeepgram(); return; }
   chunks = [];
   try {
     recorder = new MediaRecorder(stream, { ...(format ? { mimeType: format } : {}), videoBitsPerSecond: 8000000 });
@@ -662,6 +733,7 @@ function endRecording() {
   clearInterval(autoFrame);
   stopSpeech();
   stopLevel();
+  stopDeepgram();
   if (recorder && recorder.state !== 'inactive') recorder.stop();
 }
 function finishRecording() {
@@ -669,6 +741,7 @@ function finishRecording() {
   clearInterval(autoFrame);
   stopSpeech();
   stopLevel();
+  stopDeepgram();
   if (!chunks.length) { setPhase('idle'); toast('녹화된 내용이 없어요. 다시 찍어 주세요.'); return; }
   const type = recorder.mimeType || (chunks[0] && chunks[0].type) || 'video/mp4';
   const blob = new Blob(chunks, { type });
@@ -760,7 +833,23 @@ function renderKey(open) {
   $('keyBox').hidden = has && !open;
   $('keyDelete').hidden = !has;
   $('keyToggle').textContent = has ? 'AI 연결됨' : 'AI 연결';
+  const hasDg = !!dgKey();
+  $('dgStatus').textContent = hasDg ? '지금 연결되어 있어요.' : '';
+  $('dgDelete').hidden = !hasDg;
 }
+$('dgSave').onclick = () => {
+  const key = $('dgInput').value.trim();
+  if (key.length < 20) { toast('Deepgram API 키를 끝까지 넣어 주세요.'); return; }
+  store.set('deepgramKey', key);
+  $('dgInput').value = '';
+  renderKey(true);
+  toast('음성인식을 연결했어요.');
+};
+$('dgDelete').onclick = () => {
+  if (!confirm('이 폰에서 음성인식 키를 지울까요?')) return;
+  store.set('deepgramKey', '');
+  renderKey(true);
+};
 $('keyToggle').onclick = () => renderKey($('keyBox').hidden);
 $('keySave').onclick = () => {
   const key = $('keyInput').value.trim();
